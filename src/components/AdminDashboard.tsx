@@ -4,11 +4,13 @@ import { logActivity } from '../lib/activityLog';
 import { UserProfile, ShiftWithEmployee, Employee } from '../types';
 import {
   Loader2, Search, Edit2, Trash2, Plus, ChevronLeft, ChevronRight,
-  Calendar, LayoutGrid, CalendarDays, Wand2, X
+  Calendar, LayoutGrid, CalendarDays, Wand2, X, Users, Gamepad2
 } from 'lucide-react';
 import { format, startOfWeek, addDays, parseISO, isSameDay, startOfMonth, addWeeks } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import { ScheduleGenerator } from './ScheduleGenerator';
+import { EmployeesList } from './EmployeesList';
+import { AttractionsList } from './AttractionsList';
 
 // Доступные месяцы
 const MONTHS = [
@@ -28,7 +30,7 @@ interface AdminDashboardProps {
 }
 
 export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboardProps) {
-  const [activeTab, setActiveTab] = useState<'shifts' | 'schedule'>('shifts');
+  const [activeTab, setActiveTab] = useState<'shifts' | 'schedule' | 'employees' | 'attractions'>('shifts');
 
   // Управление сменами состояние
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -46,9 +48,9 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
   // Режим отображения
   const [viewMode, setViewMode] = useState<ViewMode>('month');
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
-  const [selectedWeek, setSelectedWeek] = useState<number>(0); // 0-indexed неделя в месяце
+  const [selectedWeek, setSelectedWeek] = useState<number>(0);
 
-  // Форма
+  // Форма смен
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | ''>('');
   const [workDate, setWorkDate] = useState('');
   const [isFullDay, setIsFullDay] = useState(true);
@@ -79,10 +81,8 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
     setLoading(false);
   };
 
-  // Получить год для выбранного месяца
   const getYearForMonth = (mi: number) => MONTHS.find(m => m.value === mi)?.year ?? 2025;
 
-  // Все недели в месяце
   const weeksInMonth = useMemo(() => {
     const year = getYearForMonth(selectedMonthIdx);
     const first = startOfMonth(new Date(year, selectedMonthIdx, 1));
@@ -99,14 +99,12 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
     return weeks;
   }, [selectedMonthIdx]);
 
-  // Смены выбранного месяца
   const shiftsForMonth = useMemo(() =>
     shifts.filter(s => {
       const d = parseISO(s.work_date);
       return d.getMonth() === selectedMonthIdx;
     }), [shifts, selectedMonthIdx]);
 
-  // Фильтрация по поиску
   const filteredShifts = useMemo(() => {
     const base = viewMode === 'month' ? shiftsForMonth :
       viewMode === 'week' ? shiftsForMonth.filter(s => {
@@ -208,7 +206,7 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
     <div className="space-y-6">
       {/* Вкладки */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-        <div className="flex border-b border-gray-200">
+        <div className="flex flex-wrap border-b border-gray-200">
           <button
             onClick={() => setActiveTab('shifts')}
             className={`flex-1 sm:flex-none px-6 py-4 text-sm font-medium flex items-center justify-center gap-2 border-b-2 transition ${
@@ -230,6 +228,28 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
           >
             <Wand2 className="h-4 w-4" />
             Генератор графика
+          </button>
+          <button
+            onClick={() => setActiveTab('employees')}
+            className={`flex-1 sm:flex-none px-6 py-4 text-sm font-medium flex items-center justify-center gap-2 border-b-2 transition ${
+              activeTab === 'employees'
+                ? 'border-blue-600 text-blue-600 bg-blue-50'
+                : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+            }`}
+          >
+            <Users className="h-4 w-4" />
+            Сотрудники
+          </button>
+          <button
+            onClick={() => setActiveTab('attractions')}
+            className={`flex-1 sm:flex-none px-6 py-4 text-sm font-medium flex items-center justify-center gap-2 border-b-2 transition ${
+              activeTab === 'attractions'
+                ? 'border-blue-600 text-blue-600 bg-blue-50'
+                : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+            }`}
+          >
+            <Gamepad2 className="h-4 w-4" />
+            Аттракционы
           </button>
         </div>
 
@@ -537,6 +557,18 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
         {activeTab === 'schedule' && (
           <div className="p-6">
             <ScheduleGenerator profile={profile} isSuperAdmin={isSuperAdmin} />
+          </div>
+        )}
+
+        {activeTab === 'employees' && (
+          <div className="p-6">
+            <EmployeesList isSuperAdmin={isSuperAdmin} />
+          </div>
+        )}
+
+        {activeTab === 'attractions' && (
+          <div className="p-6">
+            <AttractionsList isSuperAdmin={isSuperAdmin} />
           </div>
         )}
       </div>
