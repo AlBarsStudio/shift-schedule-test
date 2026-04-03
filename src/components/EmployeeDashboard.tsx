@@ -4,6 +4,7 @@ import { logActivity } from '../lib/activityLog';
 import { UserProfile, Shift, Priority } from '../types';
 import { Loader2, Calendar, Trash2, Plus, Star, Map, ChevronLeft, ChevronRight } from 'lucide-react';
 import { format, isBefore, startOfDay, parseISO } from 'date-fns';
+import { getRandomGreeting } from '../utils/greetings'; // Импорт функции приветствия
 
 // Доступные месяцы для выбора
 const AVAILABLE_MONTHS = [
@@ -68,6 +69,7 @@ export function EmployeeDashboard({ profile }: EmployeeDashboardProps) {
   const [priorities, setPriorities] = useState<Priority[]>([]);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(new Date());
+  const [greeting, setGreeting] = useState(''); // Состояние для приветствия
 
   // Выбранный месяц (0-indexed, из AVAILABLE_MONTHS)
   const [selectedMonthIndex, setSelectedMonthIndex] = useState<number>(() => {
@@ -89,6 +91,13 @@ export function EmployeeDashboard({ profile }: EmployeeDashboardProps) {
     const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Генерация приветствия при загрузке или изменении ФИО
+  useEffect(() => {
+    if (profile.full_name) {
+      setGreeting(getRandomGreeting(profile.full_name, new Date()));
+    }
+  }, [profile.full_name]);
 
   useEffect(() => {
     fetchData();
@@ -235,11 +244,15 @@ export function EmployeeDashboard({ profile }: EmployeeDashboardProps) {
 
   return (
     <div className="space-y-6">
-      {/* Шапка профиля */}
+      {/* Шапка профиля с приветствием */}
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex flex-col md:flex-row justify-between items-start md:items-center">
         <div>
-          <h2 className="text-2xl font-bold text-gray-900">{profile.full_name}</h2>
-          <p className="text-gray-500 text-sm mt-1">Возраст: {profile.age ?? 'Не указан'}</p>
+          <h2 className="text-2xl font-bold text-gray-900">
+            {greeting || profile.full_name}
+          </h2>
+          <p className="text-gray-500 text-sm mt-1">
+            {profile.full_name} • Возраст: {profile.age ?? 'Не указан'}
+          </p>
         </div>
         <div className="mt-4 md:mt-0 text-right">
           <div className="text-2xl font-mono text-blue-600 font-semibold">
