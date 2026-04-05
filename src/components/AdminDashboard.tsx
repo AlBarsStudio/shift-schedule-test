@@ -1,26 +1,16 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '../lib/supabase';
 import { logActivity } from '../lib/activityLog';
-import { UserProfile, ShiftWithEmployee, Employee } from '../types';
+import { UserProfile, ShiftWithEmployee, Employee, ScheduleAssignment, Attraction } from '../types';
 import {
   Loader2, Search, Edit2, Trash2, Plus, ChevronLeft, ChevronRight,
-  Calendar, LayoutGrid, CalendarDays, Wand2, X, Users, Gamepad2
+  Calendar, LayoutGrid, CalendarDays, Wand2, X, Users, Gamepad2, Clock
 } from 'lucide-react';
-import { format, startOfWeek, addDays, parseISO, isSameDay, startOfMonth, addWeeks } from 'date-fns';
+import { format, parseISO, isSameDay, startOfMonth, endOfMonth, eachDayOfInterval, isBefore, startOfDay, addMonths, subMonths } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import { ScheduleGenerator } from './ScheduleGenerator';
 import { EmployeesList } from './EmployeesList';
 import { AttractionsList } from './AttractionsList';
-
-// Доступные месяцы
-const MONTHS = [
-  { value: 3, label: 'Апрель', year: 2025 },
-  { value: 4, label: 'Май', year: 2025 },
-  { value: 5, label: 'Июнь', year: 2025 },
-  { value: 6, label: 'Июль', year: 2025 },
-  { value: 7, label: 'Август', year: 2025 },
-  { value: 8, label: 'Сентябрь', year: 2025 },
-];
 
 type ViewMode = 'day' | 'week' | 'month';
 
@@ -29,100 +19,138 @@ interface AdminDashboardProps {
   isSuperAdmin?: boolean;
 }
 
+// Функция для проверки, можно ли редактировать график (до 23:00 дня смены)
+function canEditSchedule(workDate: string): boolean {
+  const now = new Date();
+  const date = parseISO(workDate);
+  const deadline = new Date(date);
+  deadline.setHours(23, 0, 0, 0);
+  return now < deadline;
+}
+
 export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboardProps) {
   const [activeTab, setActiveTab] = useState<'shifts' | 'schedule' | 'employees' | 'attractions'>('shifts');
 
-  // Управление сменами состояние
+  // --- Общие данные ---
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [shifts, setShifts] = useState<ShiftWithEmployee[]>([]);
+  const [shifts, setShifts] = useState<ShiftWithEmployee[]>([]);       // employee_availability
+  const [scheduleAssignments, setScheduleAssignments] = useState<ScheduleAssignment[]>([]); // schedule_assignments
+  const [attractions, setAttractions] = useState<Attraction[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
-  // Выбранный месяц
-  const [selectedMonthIdx, setSelectedMonthIdx] = useState<number>(() => {
-    const cur = new Date().getMonth();
-    const found = MONTHS.find(m => m.value === cur);
-    return found ? found.value : MONTHS[0].value;
-  });
+  // --- Динамический выбор месяца/года ---
+  const [currentYear, setCurrentYear] = useState<number>(new Date().getFullYear());
+  const [currentMonth, setCurrentMonth] = useState<number>(new Date().getMonth()); // 0-11
 
-  // Режим отображения
+  // --- Режим отображения для вкладки "Управление сменами" ---
   const [viewMode, setViewMode] = useState<ViewMode>('month');
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
-  const [selectedWeek, setSelectedWeek] = useState<number>(0);
+  const [selectedWeekStart, setSelectedWeekStart] = useState<Date>(() => startOfMonth(new Date()));
 
-  // Форма смен
+  // --- Форма для employee_availability (старые смены) ---
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | ''>('');
   const [workDate, setWorkDate] = useState('');
   const [isFullDay, setIsFullDay] = useState(true);
   const [startTime, setStartTime] = useState('');
   const [endTime, setEndTime] = useState('');
   const [editingShiftId, setEditingShiftId] = useState<number | null>(null);
-  const [showForm, setShowForm] = useState(false);
+  const [showShiftForm, setShowShiftForm] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+
+  // --- Форма для schedule_assignments (график от админа) ---
+  const [showScheduleForm, setShowScheduleForm] = useState(false);
+  const [editingScheduleId, setEditingScheduleId] = useState<number | null>(null);
+  const [scheduleEmployeeId, setScheduleEmployeeId] = useState<number | ''>('');
+  const [scheduleAttractionId, setScheduleAttractionId] = useState<number | ''>('');
+  const [scheduleWorkDate, setScheduleWorkDate] = useState('');
+  const [scheduleStartTime, setScheduleStartTime] = useState('');
+  const [scheduleEndTime, setScheduleEndTime] = useState('');
+  const [scheduleFormError, setScheduleFormError] = useState<string | null>(null);
+
+  // Загрузка данных
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      // Сотрудники
+      const { data: empData } = await supabase
+        .from('employees')
+        .select('id, full_name, age, base_hourly_rate')
+        .order('full_name');
+      if (empData) setEmployees(empData);
+
+      // Аттракционы
+      const { data: attrData } = await supabase
+        .from('attractions')
+        .select('id, name, coefficient');
+      if (attrData) setAttractions(attrData);
+
+      // Старые смены (employee_availability)
+      const { data: shiftData } = await supabase
+        .from('employee_availability')
+        .select('id, employee_id, work_date, is_full_day, start_time, end_time, employees(full_name)')
+        .order('work_date', { ascending: true });
+      if (shiftData) setShifts(shiftData as unknown as ShiftWithEmployee[]);
+
+      // График от администратора (schedule_assignments)
+      const { data: scheduleData } = await supabase
+        .from('schedule_assignments')
+        .select(`
+          id, work_date, employee_id, attraction_id, start_time, end_time,
+          created_at, updated_at,
+          employees(full_name),
+          attractions(name, coefficient)
+        `)
+        .order('work_date', { ascending: true });
+      if (scheduleData) setScheduleAssignments(scheduleData as ScheduleAssignment[]);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchData();
   }, []);
 
-  const fetchData = async () => {
-    setLoading(true);
-    const { data: empData } = await supabase
-      .from('employees')
-      .select('id, full_name, age')
-      .order('full_name');
-    if (empData) setEmployees(empData);
-
-    const { data: shiftData } = await supabase
-      .from('employee_availability')
-      .select('id, employee_id, work_date, is_full_day, start_time, end_time, employees(full_name)')
-      .order('work_date', { ascending: true });
-    if (shiftData) setShifts(shiftData as unknown as ShiftWithEmployee[]);
-
-    setLoading(false);
-  };
-
-  const getYearForMonth = (mi: number) => MONTHS.find(m => m.value === mi)?.year ?? 2025;
-
-  const weeksInMonth = useMemo(() => {
-    const year = getYearForMonth(selectedMonthIdx);
-    const first = startOfMonth(new Date(year, selectedMonthIdx, 1));
-    const weeks: Date[][] = [];
-    let current = startOfWeek(first, { weekStartsOn: 1 });
-    for (let w = 0; w < 5; w++) {
-      const days: Date[] = [];
-      for (let d = 0; d < 7; d++) {
-        days.push(addDays(current, d));
-      }
-      weeks.push(days);
-      current = addWeeks(current, 1);
-    }
-    return weeks;
-  }, [selectedMonthIdx]);
-
-  const shiftsForMonth = useMemo(() =>
-    shifts.filter(s => {
+  // --- Фильтрация для employee_availability ---
+  const shiftsForMonth = useMemo(() => {
+    return shifts.filter(s => {
       const d = parseISO(s.work_date);
-      return d.getMonth() === selectedMonthIdx;
-    }), [shifts, selectedMonthIdx]);
+      return d.getFullYear() === currentYear && d.getMonth() === currentMonth;
+    });
+  }, [shifts, currentYear, currentMonth]);
 
   const filteredShifts = useMemo(() => {
-    const base = viewMode === 'month' ? shiftsForMonth :
-      viewMode === 'week' ? shiftsForMonth.filter(s => {
+    let base = shiftsForMonth;
+    if (viewMode === 'day') {
+      base = base.filter(s => isSameDay(parseISO(s.work_date), selectedDate));
+    } else if (viewMode === 'week') {
+      const weekEnd = addDays(selectedWeekStart, 6);
+      base = base.filter(s => {
         const d = parseISO(s.work_date);
-        const week = weeksInMonth[selectedWeek] || [];
-        return week.some(wd => isSameDay(wd, d));
-      }) :
-      shiftsForMonth.filter(s => isSameDay(parseISO(s.work_date), selectedDate));
-
+        return d >= selectedWeekStart && d <= weekEnd;
+      });
+    }
     if (!search.trim()) return base;
     const q = search.toLowerCase();
     return base.filter(s =>
       s.employees?.full_name?.toLowerCase().includes(q) ||
       s.work_date.includes(q)
     );
-  }, [shifts, shiftsForMonth, viewMode, selectedWeek, selectedDate, weeksInMonth, search]);
+  }, [shiftsForMonth, viewMode, selectedDate, selectedWeekStart, search]);
 
-  const resetForm = () => {
+  // --- Фильтрация для schedule_assignments ---
+  const scheduleForMonth = useMemo(() => {
+    return scheduleAssignments.filter(s => {
+      const d = parseISO(s.work_date);
+      return d.getFullYear() === currentYear && d.getMonth() === currentMonth;
+    });
+  }, [scheduleAssignments, currentYear, currentMonth]);
+
+  // --- CRUD для employee_availability ---
+  const resetShiftForm = () => {
     setEditingShiftId(null);
     setSelectedEmployeeId('');
     setWorkDate('');
@@ -130,7 +158,7 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
     setStartTime('');
     setEndTime('');
     setFormError(null);
-    setShowForm(false);
+    setShowShiftForm(false);
   };
 
   const handleSaveShift = async (e: React.FormEvent) => {
@@ -165,23 +193,21 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
         `Смена добавлена сотруднику ${emp?.full_name} на ${workDate}`
       );
     }
-
-    resetForm();
+    resetShiftForm();
     fetchData();
   };
 
-  const handleEdit = (shift: ShiftWithEmployee) => {
+  const handleEditShift = (shift: ShiftWithEmployee) => {
     setEditingShiftId(shift.id);
     setSelectedEmployeeId(shift.employee_id);
     setWorkDate(shift.work_date);
     setIsFullDay(shift.is_full_day);
     setStartTime(shift.start_time || '');
     setEndTime(shift.end_time || '');
-    setFormError(null);
-    setShowForm(true);
+    setShowShiftForm(true);
   };
 
-  const handleDelete = async (shift: ShiftWithEmployee) => {
+  const handleDeleteShift = async (shift: ShiftWithEmployee) => {
     if (!confirm('Удалить смену?')) return;
     const { error } = await supabase.from('employee_availability').delete().eq('id', shift.id);
     if (!error) {
@@ -193,8 +219,134 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
     }
   };
 
-  const currentMonth = MONTHS.find(m => m.value === selectedMonthIdx);
-  const currentMonthListIdx = MONTHS.findIndex(m => m.value === selectedMonthIdx);
+  // --- CRUD для schedule_assignments ---
+  const resetScheduleForm = () => {
+    setEditingScheduleId(null);
+    setScheduleEmployeeId('');
+    setScheduleAttractionId('');
+    setScheduleWorkDate('');
+    setScheduleStartTime('');
+    setScheduleEndTime('');
+    setScheduleFormError(null);
+    setShowScheduleForm(false);
+  };
+
+  const handleSaveSchedule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setScheduleFormError(null);
+    if (!scheduleEmployeeId) { setScheduleFormError('Выберите сотрудника'); return; }
+    if (!scheduleAttractionId) { setScheduleFormError('Выберите аттракцион'); return; }
+    if (!scheduleWorkDate) { setScheduleFormError('Укажите дату'); return; }
+    if (!scheduleStartTime || !scheduleEndTime) { setScheduleFormError('Укажите время начала и окончания'); return; }
+    if (scheduleStartTime >= scheduleEndTime) { setScheduleFormError('Время окончания должно быть позже начала'); return; }
+
+    // Проверка на возможность редактирования (если редактируем существующую запись)
+    if (editingScheduleId) {
+      const existing = scheduleAssignments.find(s => s.id === editingScheduleId);
+      if (existing && !canEditSchedule(existing.work_date)) {
+        setScheduleFormError('Редактирование невозможно: прошло 23:00 дня смены');
+        return;
+      }
+    }
+
+    const scheduleData = {
+      employee_id: Number(scheduleEmployeeId),
+      attraction_id: Number(scheduleAttractionId),
+      work_date: scheduleWorkDate,
+      start_time: scheduleStartTime,
+      end_time: scheduleEndTime,
+    };
+
+    const emp = employees.find(e => e.id === Number(scheduleEmployeeId));
+    const attr = attractions.find(a => a.id === Number(scheduleAttractionId));
+
+    if (editingScheduleId) {
+      const { error } = await supabase
+        .from('schedule_assignments')
+        .update(scheduleData)
+        .eq('id', editingScheduleId);
+      if (error) { setScheduleFormError('Ошибка при сохранении'); return; }
+      await logActivity(
+        isSuperAdmin ? 'superadmin' : 'admin', profile.id, 'schedule_update',
+        `Обновлено назначение: сотрудник ${emp?.full_name} на аттракцион ${attr?.name} ${scheduleWorkDate}`
+      );
+    } else {
+      const { error } = await supabase.from('schedule_assignments').insert([scheduleData]);
+      if (error) { setScheduleFormError('Ошибка при добавлении'); return; }
+      await logActivity(
+        isSuperAdmin ? 'superadmin' : 'admin', profile.id, 'schedule_add',
+        `Добавлено назначение: сотрудник ${emp?.full_name} на аттракцион ${attr?.name} ${scheduleWorkDate}`
+      );
+    }
+    resetScheduleForm();
+    fetchData();
+  };
+
+  const handleEditSchedule = (schedule: ScheduleAssignment) => {
+    if (!canEditSchedule(schedule.work_date)) {
+      alert('Редактирование невозможно: прошло 23:00 дня смены');
+      return;
+    }
+    setEditingScheduleId(schedule.id);
+    setScheduleEmployeeId(schedule.employee_id);
+    setScheduleAttractionId(schedule.attraction_id);
+    setScheduleWorkDate(schedule.work_date);
+    setScheduleStartTime(schedule.start_time.slice(0,5));
+    setScheduleEndTime(schedule.end_time.slice(0,5));
+    setShowScheduleForm(true);
+  };
+
+  const handleDeleteSchedule = async (schedule: ScheduleAssignment) => {
+    if (!canEditSchedule(schedule.work_date)) {
+      alert('Удаление невозможно: прошло 23:00 дня смены');
+      return;
+    }
+    if (!confirm('Удалить назначение?')) return;
+    const { error } = await supabase.from('schedule_assignments').delete().eq('id', schedule.id);
+    if (!error) {
+      await logActivity(
+        isSuperAdmin ? 'superadmin' : 'admin', profile.id, 'schedule_delete',
+        `Удалено назначение для сотрудника ${schedule.employees?.full_name} на ${schedule.work_date}`
+      );
+      fetchData();
+    }
+  };
+
+  // --- Навигация по месяцам/годам ---
+  const handlePrevMonth = () => {
+    const newDate = subMonths(new Date(currentYear, currentMonth, 1), 1);
+    setCurrentYear(newDate.getFullYear());
+    setCurrentMonth(newDate.getMonth());
+  };
+  const handleNextMonth = () => {
+    const newDate = addMonths(new Date(currentYear, currentMonth, 1), 1);
+    setCurrentYear(newDate.getFullYear());
+    setCurrentMonth(newDate.getMonth());
+  };
+
+  const monthLabel = format(new Date(currentYear, currentMonth, 1), 'LLLL yyyy', { locale: ru });
+
+  // Вспомогательные функции для недельного отображения
+  const getWeeksInMonth = () => {
+    const start = startOfMonth(new Date(currentYear, currentMonth, 1));
+    const end = endOfMonth(start);
+    const weeks: Date[][] = [];
+    let current = startOfMonth(start);
+    while (current <= end) {
+      const weekStart = startOfWeek(current, { weekStartsOn: 1 });
+      const week: Date[] = [];
+      for (let i = 0; i < 7; i++) {
+        week.push(addDays(weekStart, i));
+      }
+      weeks.push(week);
+      current = addDays(weekStart, 7);
+    }
+    return weeks;
+  };
+  const weeksInMonth = useMemo(() => getWeeksInMonth(), [currentYear, currentMonth]);
+  const currentWeekIndex = useMemo(() => {
+    return weeksInMonth.findIndex(week => week.some(day => isSameDay(day, selectedWeekStart)));
+  }, [weeksInMonth, selectedWeekStart]);
 
   if (loading) return (
     <div className="flex justify-center p-16">
@@ -216,7 +368,7 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
             }`}
           >
             <Calendar className="h-4 w-4" />
-            Управление сменами
+            Управление сменами (старые)
           </button>
           <button
             onClick={() => setActiveTab('schedule')}
@@ -227,7 +379,7 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
             }`}
           >
             <Wand2 className="h-4 w-4" />
-            Генератор графика
+            График (новый)
           </button>
           <button
             onClick={() => setActiveTab('employees')}
@@ -253,47 +405,23 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
           </button>
         </div>
 
+        {/* ========== ВКЛАДКА "Управление сменами (старые)" ========== */}
         {activeTab === 'shifts' && (
           <div className="p-6 space-y-6">
-            {/* Выбор месяца */}
-            <div>
-              <div className="flex items-center justify-between mb-3">
-                <button
-                  onClick={() => currentMonthListIdx > 0 && setSelectedMonthIdx(MONTHS[currentMonthListIdx - 1].value)}
-                  disabled={currentMonthListIdx === 0}
-                  className="p-2 rounded-lg hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
-                >
-                  <ChevronLeft className="h-5 w-5 text-gray-600" />
-                </button>
-                <span className="text-base font-semibold text-gray-800">{currentMonth?.label} {currentMonth?.year}</span>
-                <button
-                  onClick={() => currentMonthListIdx < MONTHS.length - 1 && setSelectedMonthIdx(MONTHS[currentMonthListIdx + 1].value)}
-                  disabled={currentMonthListIdx === MONTHS.length - 1}
-                  className="p-2 rounded-lg hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
-                >
-                  <ChevronRight className="h-5 w-5 text-gray-600" />
-                </button>
-              </div>
-              <div className="flex flex-wrap gap-2 justify-center">
-                {MONTHS.map(m => (
-                  <button
-                    key={m.value}
-                    onClick={() => { setSelectedMonthIdx(m.value); setSelectedWeek(0); }}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-                      selectedMonthIdx === m.value
-                        ? 'bg-blue-600 text-white shadow-sm'
-                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                    }`}
-                  >
-                    {m.label}
-                  </button>
-                ))}
-              </div>
+            {/* Навигация по месяцам */}
+            <div className="flex items-center justify-between mb-3">
+              <button onClick={handlePrevMonth} className="p-2 rounded-lg hover:bg-gray-100">
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <span className="text-lg font-semibold text-gray-800">{monthLabel}</span>
+              <button onClick={handleNextMonth} className="p-2 rounded-lg hover:bg-gray-100">
+                <ChevronRight className="h-5 w-5" />
+              </button>
             </div>
 
             {/* Режим отображения */}
             <div className="flex items-center gap-2 justify-center">
-              <span className="text-sm text-gray-500 mr-2">Вид:</span>
+              <span className="text-sm text-gray-500">Вид:</span>
               {(['day', 'week', 'month'] as ViewMode[]).map(mode => (
                 <button
                   key={mode}
@@ -303,93 +431,59 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
                   }`}
                 >
                   {mode === 'day' && <><CalendarDays className="h-3.5 w-3.5" />День</>}
-                  {mode === 'week' && <><ChevronRight className="h-3.5 w-3.5" />Неделя</>}
-                  {mode === 'month' && <><LayoutGrid className="h-3.5 w-3.5" />Месяц</>}
+                  {mode === 'week' && <><LayoutGrid className="h-3.5 w-3.5" />Неделя</>}
+                  {mode === 'month' && <><Calendar className="h-3.5 w-3.5" />Месяц</>}
                 </button>
               ))}
             </div>
 
-            {/* Навигация по дням/неделям */}
-            {viewMode === 'week' && (
-              <div className="flex items-center justify-center gap-3">
-                <button
-                  onClick={() => setSelectedWeek(w => Math.max(0, w - 1))}
-                  disabled={selectedWeek === 0}
-                  className="p-1.5 rounded-lg hover:bg-gray-100 disabled:opacity-30 transition"
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                </button>
-                <div className="flex gap-2">
-                  {weeksInMonth.map((_, wi) => (
-                    <button
-                      key={wi}
-                      onClick={() => setSelectedWeek(wi)}
-                      className={`px-3 py-1 rounded-lg text-sm font-medium transition ${
-                        selectedWeek === wi ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                      }`}
-                    >
-                      {wi + 1} нед.
-                    </button>
-                  ))}
-                </div>
-                <button
-                  onClick={() => setSelectedWeek(w => Math.min(weeksInMonth.length - 1, w + 1))}
-                  disabled={selectedWeek === weeksInMonth.length - 1}
-                  className="p-1.5 rounded-lg hover:bg-gray-100 disabled:opacity-30 transition"
-                >
-                  <ChevronRight className="h-4 w-4" />
-                </button>
-              </div>
-            )}
-
-            {viewMode === 'week' && weeksInMonth[selectedWeek] && (
-              <div className="grid grid-cols-7 gap-1">
-                {weeksInMonth[selectedWeek].map((day, di) => (
-                  <div key={di} className={`rounded-lg p-2 text-center text-xs font-medium ${
-                    day.getMonth() === selectedMonthIdx ? 'bg-gray-50 border border-gray-200' : 'bg-gray-50 text-gray-300 border border-gray-100'
-                  }`}>
-                    <div className="text-gray-400 mb-1">{format(day, 'EEE', { locale: ru })}</div>
-                    <div className={day.getMonth() === selectedMonthIdx ? 'text-gray-800 font-bold' : 'text-gray-300'}>
-                      {format(day, 'd')}
-                    </div>
-                    {day.getMonth() === selectedMonthIdx && (
-                      <div className="mt-1">
-                        {shiftsForMonth.filter(s => isSameDay(parseISO(s.work_date), day)).length > 0 && (
-                          <span className="bg-blue-500 text-white text-xs rounded-full px-1.5 py-0.5">
-                            {shiftsForMonth.filter(s => isSameDay(parseISO(s.work_date), day)).length}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-
+            {/* Дополнительные элементы навигации для дня/недели */}
             {viewMode === 'day' && (
               <div className="flex items-center justify-center gap-3">
-                <button
-                  onClick={() => setSelectedDate(d => addDays(d, -1))}
-                  className="p-1.5 rounded-lg hover:bg-gray-100 transition"
-                >
+                <button onClick={() => setSelectedDate(d => addDays(d, -1))} className="p-1.5 rounded-lg hover:bg-gray-100">
                   <ChevronLeft className="h-4 w-4" />
                 </button>
                 <input
                   type="date"
                   value={format(selectedDate, 'yyyy-MM-dd')}
                   onChange={e => setSelectedDate(parseISO(e.target.value))}
-                  className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-blue-500"
+                  className="border rounded-lg px-3 py-1.5 text-sm"
                 />
+                <button onClick={() => setSelectedDate(d => addDays(d, 1))} className="p-1.5 rounded-lg hover:bg-gray-100">
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+
+            {viewMode === 'week' && weeksInMonth.length > 0 && (
+              <div className="flex items-center justify-center gap-3">
                 <button
-                  onClick={() => setSelectedDate(d => addDays(d, 1))}
-                  className="p-1.5 rounded-lg hover:bg-gray-100 transition"
+                  onClick={() => {
+                    const idx = currentWeekIndex;
+                    if (idx > 0) setSelectedWeekStart(weeksInMonth[idx-1][0]);
+                  }}
+                  disabled={currentWeekIndex <= 0}
+                  className="p-1.5 rounded-lg hover:bg-gray-100 disabled:opacity-30"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <div className="text-sm font-medium">
+                  Неделя {currentWeekIndex + 1} / {weeksInMonth.length}
+                </div>
+                <button
+                  onClick={() => {
+                    const idx = currentWeekIndex;
+                    if (idx < weeksInMonth.length - 1) setSelectedWeekStart(weeksInMonth[idx+1][0]);
+                  }}
+                  disabled={currentWeekIndex >= weeksInMonth.length - 1}
+                  className="p-1.5 rounded-lg hover:bg-gray-100 disabled:opacity-30"
                 >
                   <ChevronRight className="h-4 w-4" />
                 </button>
               </div>
             )}
 
-            {/* Кнопка добавить + поиск */}
+            {/* Поиск и кнопка добавления */}
             <div className="flex flex-col sm:flex-row gap-3">
               <div className="relative flex-1">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
@@ -398,94 +492,58 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
                   placeholder="Поиск по ФИО или дате..."
                   value={search}
                   onChange={e => setSearch(e.target.value)}
-                  className="block w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  className="w-full pl-9 pr-3 py-2 border rounded-lg text-sm"
                 />
               </div>
               <button
-                onClick={() => { resetForm(); setShowForm(true); }}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition"
+                onClick={() => { resetShiftForm(); setShowShiftForm(true); }}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
               >
                 <Plus className="h-4 w-4" />
-                Добавить смену
+                Добавить смену (старый формат)
               </button>
             </div>
 
-            {/* Форма */}
-            {showForm && (
-              <div className="bg-gray-50 border border-gray-200 rounded-xl p-5">
-                <div className="flex items-center justify-between mb-4">
-                  <h4 className="font-semibold text-gray-800">
-                    {editingShiftId ? 'Редактировать смену' : 'Добавить смену'}
-                  </h4>
-                  <button onClick={resetForm} className="text-gray-400 hover:text-gray-600">
-                    <X className="h-5 w-5" />
-                  </button>
+            {/* Форма для старых смен */}
+            {showShiftForm && (
+              <div className="bg-gray-50 border rounded-xl p-5">
+                <div className="flex justify-between items-center mb-4">
+                  <h4 className="font-semibold">{editingShiftId ? 'Редактировать смену' : 'Добавить смену'}</h4>
+                  <button onClick={resetShiftForm} className="text-gray-400 hover:text-gray-600"><X className="h-5 w-5" /></button>
                 </div>
                 <form onSubmit={handleSaveShift} className="space-y-4">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Сотрудник</label>
+                      <label className="block text-sm font-medium mb-1">Сотрудник</label>
                       <select
-                        required
-                        value={selectedEmployeeId}
-                        onChange={e => setSelectedEmployeeId(Number(e.target.value) || '')}
-                        className="block w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 bg-white"
+                        required value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(Number(e.target.value) || '')}
+                        className="w-full border rounded-lg px-3 py-2 text-sm"
                       >
                         <option value="">— Выберите —</option>
-                        {employees.map(e => (
-                          <option key={e.id} value={e.id}>{e.full_name}</option>
-                        ))}
+                        {employees.map(e => <option key={e.id} value={e.id}>{e.full_name}</option>)}
                       </select>
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Дата смены</label>
-                      <input
-                        type="date"
-                        required
-                        value={workDate}
-                        onChange={e => setWorkDate(e.target.value)}
-                        className="block w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
-                      />
+                      <label className="block text-sm font-medium mb-1">Дата</label>
+                      <input type="date" required value={workDate} onChange={e => setWorkDate(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
                     </div>
                     <div className="flex items-center pt-6">
-                      <label className="flex items-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={isFullDay}
-                          onChange={e => setIsFullDay(e.target.checked)}
-                          className="h-4 w-4 text-blue-600 border-gray-300 rounded"
-                        />
-                        <span className="ml-2 text-sm text-gray-700">Полный день</span>
+                      <label className="flex items-center gap-2">
+                        <input type="checkbox" checked={isFullDay} onChange={e => setIsFullDay(e.target.checked)} className="h-4 w-4" />
+                        <span className="text-sm">Полный день</span>
                       </label>
                     </div>
                   </div>
-
                   {!isFullDay && (
                     <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">Начало</label>
-                        <input type="time" required value={startTime} onChange={e => setStartTime(e.target.value)}
-                          className="block w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" />
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">Конец</label>
-                        <input type="time" required value={endTime} onChange={e => setEndTime(e.target.value)}
-                          className="block w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" />
-                      </div>
+                      <div><label className="block text-sm font-medium mb-1">Начало</label><input type="time" required value={startTime} onChange={e => setStartTime(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" /></div>
+                      <div><label className="block text-sm font-medium mb-1">Конец</label><input type="time" required value={endTime} onChange={e => setEndTime(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" /></div>
                     </div>
                   )}
-
-                  {formError && (
-                    <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-700">{formError}</div>
-                  )}
-
+                  {formError && <div className="bg-red-50 text-red-700 p-3 rounded-lg text-sm">{formError}</div>}
                   <div className="flex justify-end gap-3">
-                    <button type="button" onClick={resetForm}
-                      className="px-4 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 transition">
-                      Отмена
-                    </button>
-                    <button type="submit"
-                      className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 flex items-center gap-2 transition">
+                    <button type="button" onClick={resetShiftForm} className="px-4 py-2 border rounded-lg text-sm">Отмена</button>
+                    <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm flex items-center gap-2">
                       {editingShiftId ? <><Edit2 className="h-4 w-4" />Сохранить</> : <><Plus className="h-4 w-4" />Добавить</>}
                     </button>
                   </div>
@@ -493,82 +551,119 @@ export function AdminDashboard({ profile, isSuperAdmin = false }: AdminDashboard
               </div>
             )}
 
-            {/* Таблица смен */}
-            <div className="overflow-x-auto border border-gray-200 rounded-xl">
+            {/* Таблица старых смен */}
+            <div className="overflow-x-auto border rounded-xl">
               <table className="min-w-full divide-y divide-gray-100">
                 <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Сотрудник</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Дата</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Смена</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase">Действия</th>
-                  </tr>
+                  <tr><th className="px-4 py-3 text-left text-xs font-semibold">Сотрудник</th><th>Дата</th><th>Смена</th><th className="text-right">Действия</th></tr>
                 </thead>
-                <tbody className="divide-y divide-gray-100 bg-white">
+                <tbody className="divide-y bg-white">
                   {filteredShifts.map(shift => (
-                    <tr key={shift.id} className="hover:bg-gray-50 transition">
-                      <td className="px-4 py-3 text-sm font-medium text-gray-900">
-                        {shift.employees?.full_name || 'Неизвестно'}
-                      </td>
-                      <td className="px-4 py-3 text-sm text-gray-600">
-                        {format(parseISO(shift.work_date), 'dd.MM.yyyy')}
-                        <span className="ml-2 text-xs text-gray-400">
-                          {format(parseISO(shift.work_date), 'EEE', { locale: ru })}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-sm text-gray-600">
-                        {shift.is_full_day ? (
-                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">Полный день</span>
-                        ) : (
-                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
-                            {shift.start_time?.slice(0, 5)} – {shift.end_time?.slice(0, 5)}
-                          </span>
-                        )}
-                      </td>
+                    <tr key={shift.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 text-sm font-medium">{shift.employees?.full_name || '—'}</td>
+                      <td className="px-4 py-3 text-sm">{format(parseISO(shift.work_date), 'dd.MM.yyyy')} <span className="text-xs text-gray-400 ml-1">{format(parseISO(shift.work_date), 'EEE', { locale: ru })}</span></td>
+                      <td className="px-4 py-3 text-sm">{shift.is_full_day ? <span className="bg-green-100 text-green-800 px-2 py-0.5 rounded-full text-xs">Полный день</span> : <span className="bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded-full text-xs">{shift.start_time?.slice(0,5)}–{shift.end_time?.slice(0,5)}</span>}</td>
                       <td className="px-4 py-3 text-right">
-                        <button onClick={() => handleEdit(shift)}
-                          className="text-blue-600 hover:text-blue-800 p-1.5 rounded-lg hover:bg-blue-50 transition mr-1">
-                          <Edit2 className="h-4 w-4" />
-                        </button>
-                        <button onClick={() => handleDelete(shift)}
-                          className="text-red-500 hover:text-red-700 p-1.5 rounded-lg hover:bg-red-50 transition">
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        <button onClick={() => handleEditShift(shift)} className="text-blue-600 p-1.5 rounded-lg hover:bg-blue-50"><Edit2 className="h-4 w-4" /></button>
+                        <button onClick={() => handleDeleteShift(shift)} className="text-red-500 p-1.5 rounded-lg hover:bg-red-50"><Trash2 className="h-4 w-4" /></button>
                       </td>
                     </tr>
                   ))}
-                  {filteredShifts.length === 0 && (
-                    <tr>
-                      <td colSpan={4} className="px-4 py-10 text-center text-sm text-gray-400">
-                        <Calendar className="mx-auto h-8 w-8 mb-2 opacity-40" />
-                        Смены не найдены
-                      </td>
-                    </tr>
-                  )}
+                  {filteredShifts.length === 0 && <tr><td colSpan={4} className="text-center py-10 text-gray-400">Смен не найдено</td></tr>}
                 </tbody>
               </table>
             </div>
-            <div className="text-sm text-gray-500 text-right">
-              Показано: {filteredShifts.length} смен
+          </div>
+        )}
+
+        {/* ========== ВКЛАДКА "График (новый)" ========== */}
+        {activeTab === 'schedule' && (
+          <div className="p-6 space-y-6">
+            {/* Навигация по месяцам (такая же) */}
+            <div className="flex items-center justify-between mb-3">
+              <button onClick={handlePrevMonth} className="p-2 rounded-lg hover:bg-gray-100"><ChevronLeft className="h-5 w-5" /></button>
+              <span className="text-lg font-semibold text-gray-800">{monthLabel}</span>
+              <button onClick={handleNextMonth} className="p-2 rounded-lg hover:bg-gray-100"><ChevronRight className="h-5 w-5" /></button>
+            </div>
+
+            {/* Кнопка добавления нового назначения */}
+            <div className="flex justify-end">
+              <button
+                onClick={() => { resetScheduleForm(); setShowScheduleForm(true); }}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+              >
+                <Plus className="h-4 w-4" />
+                Добавить назначение
+              </button>
+            </div>
+
+            {/* Форма для schedule_assignments */}
+            {showScheduleForm && (
+              <div className="bg-gray-50 border rounded-xl p-5">
+                <div className="flex justify-between items-center mb-4">
+                  <h4 className="font-semibold">{editingScheduleId ? 'Редактировать назначение' : 'Добавить назначение'}</h4>
+                  <button onClick={resetScheduleForm} className="text-gray-400 hover:text-gray-600"><X className="h-5 w-5" /></button>
+                </div>
+                <form onSubmit={handleSaveSchedule} className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div><label className="block text-sm font-medium mb-1">Сотрудник</label><select required value={scheduleEmployeeId} onChange={e => setScheduleEmployeeId(Number(e.target.value) || '')} className="w-full border rounded-lg px-3 py-2 text-sm"><option value="">— Выберите —</option>{employees.map(e => <option key={e.id} value={e.id}>{e.full_name}</option>)}</select></div>
+                    <div><label className="block text-sm font-medium mb-1">Аттракцион</label><select required value={scheduleAttractionId} onChange={e => setScheduleAttractionId(Number(e.target.value) || '')} className="w-full border rounded-lg px-3 py-2 text-sm"><option value="">— Выберите —</option>{attractions.map(a => <option key={a.id} value={a.id}>{a.name} (коэфф. {a.coefficient})</option>)}</select></div>
+                    <div><label className="block text-sm font-medium mb-1">Дата</label><input type="date" required value={scheduleWorkDate} onChange={e => setScheduleWorkDate(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" /></div>
+                    <div className="grid grid-cols-2 gap-2"><div><label className="block text-sm font-medium mb-1">Начало</label><input type="time" required value={scheduleStartTime} onChange={e => setScheduleStartTime(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" /></div><div><label className="block text-sm font-medium mb-1">Конец</label><input type="time" required value={scheduleEndTime} onChange={e => setScheduleEndTime(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" /></div></div>
+                  </div>
+                  {scheduleFormError && <div className="bg-red-50 text-red-700 p-3 rounded-lg text-sm">{scheduleFormError}</div>}
+                  <div className="flex justify-end gap-3">
+                    <button type="button" onClick={resetScheduleForm} className="px-4 py-2 border rounded-lg text-sm">Отмена</button>
+                    <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm flex items-center gap-2">{editingScheduleId ? <><Edit2 className="h-4 w-4" />Сохранить</> : <><Plus className="h-4 w-4" />Добавить</>}</button>
+                  </div>
+                </form>
+              </div>
+            )}
+
+            {/* Таблица назначений */}
+            <div className="overflow-x-auto border rounded-xl">
+              <table className="min-w-full divide-y divide-gray-100">
+                <thead className="bg-gray-50">
+                  <tr><th className="px-4 py-3 text-left text-xs font-semibold">Сотрудник</th><th>Аттракцион</th><th>Дата</th><th>Время</th><th className="text-right">Действия</th></tr>
+                </thead>
+                <tbody className="divide-y bg-white">
+                  {scheduleForMonth.map(s => (
+                    <tr key={s.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 text-sm font-medium">{s.employees?.full_name || '—'}</td>
+                      <td className="px-4 py-3 text-sm">{s.attractions?.name || '—'} <span className="text-xs text-gray-400">(x{s.attractions?.coefficient})</span></td>
+                      <td className="px-4 py-3 text-sm">{format(parseISO(s.work_date), 'dd.MM.yyyy')}</td>
+                      <td className="px-4 py-3 text-sm">{s.start_time.slice(0,5)} – {s.end_time.slice(0,5)}</td>
+                      <td className="px-4 py-3 text-right">
+                        <button onClick={() => handleEditSchedule(s)} className="text-blue-600 p-1.5 rounded-lg hover:bg-blue-50" disabled={!canEditSchedule(s.work_date)}><Edit2 className="h-4 w-4" /></button>
+                        <button onClick={() => handleDeleteSchedule(s)} className="text-red-500 p-1.5 rounded-lg hover:bg-red-50" disabled={!canEditSchedule(s.work_date)}><Trash2 className="h-4 w-4" /></button>
+                        {!canEditSchedule(s.work_date) && <span className="text-xs text-gray-400 ml-2">(блок)</span>}
+                      </td>
+                    </tr>
+                  ))}
+                  {scheduleForMonth.length === 0 && <tr><td colSpan={5} className="text-center py-10 text-gray-400">Нет назначений на этот месяц</td></tr>}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Дополнительно можно отобразить генератор графика (если он нужен) */}
+            <div className="mt-8 border-t pt-6">
+              <h3 className="text-lg font-semibold mb-3">Генератор графика (автоматическое создание)</h3>
+              <ScheduleGenerator profile={profile} isSuperAdmin={isSuperAdmin} onScheduleGenerated={fetchData} />
             </div>
           </div>
         )}
 
-        {activeTab === 'schedule' && (
-          <div className="p-6">
-            <ScheduleGenerator profile={profile} isSuperAdmin={isSuperAdmin} />
-          </div>
-        )}
-
+        {/* Вкладка "Сотрудники" – передаём обновлённые пропсы для редактирования ставки */}
         {activeTab === 'employees' && (
           <div className="p-6">
-            <EmployeesList isSuperAdmin={isSuperAdmin} />
+            <EmployeesList isSuperAdmin={isSuperAdmin} onEmployeeUpdate={fetchData} />
           </div>
         )}
 
+        {/* Вкладка "Аттракционы" – передаём пропсы для редактирования коэффициента */}
         {activeTab === 'attractions' && (
           <div className="p-6">
-            <AttractionsList isSuperAdmin={isSuperAdmin} />
+            <AttractionsList isSuperAdmin={isSuperAdmin} onAttractionUpdate={fetchData} />
           </div>
         )}
       </div>
